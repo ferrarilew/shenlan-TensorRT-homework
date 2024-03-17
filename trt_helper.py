@@ -119,15 +119,44 @@ class TrtNetworkHelper():
 
         return gelu_layer.get_output(0)
 
+    def getLayerNormPlugin(self):
+        for c in trt.get_plugin_registry().plugin_creator_list:
+            if c.name == 'LayerNorm':
+                return c.create_plugin(c.name, trt.PluginFieldCollection([]))
+        return None
+
     def addLayerNorm(self, x, gamma, beta, layer_name=None, precision=None):
         # TODO: create your layer norm plugin
+        inputTensorList = []
+        inputTensorList.append(x)
+        pluginLayer = self.network.add_plugin_v2(inputTensorList, self.getLayerNormPlugin())
 
-        return trt_layer.get_output(0)
+        self.network.mark_output(pluginLayer.get_output(0))
+        if layer_name is None:
+            layer_name = "trt.LayerNorm"
+        else:
+            layer_name = "trt.LayerNorm." + layer_name
+
+        self.layer_post_process(pluginLayer, layer_name, precision)
+        return pluginLayer.get_output(0)
 
     def addLinear(self, x, weight, bias, layer_name=None, precision=None):
-        # TODO: add Linear
+        weight = np.array([weight])
+        constant_layer = self.network.add_constant(weight.shape, trt.Weights(weight))
+        X_mul = self.network.add_matrix_multiply(x, trt.MatrixOperation.NONE, constant_layer.get_output(0), trt.MatrixOperation.NONE)
 
-        return x
+        out = X_mul.get_output(0)
+        bias = np.array([[bias]])
+        bias_layer = self.network.add_constant(bias.shape, trt.Weights(bias))
+        trt_layer = self.network.add_elementwise(X_mul.get_output(0), bias_layer.get_output(0), trt.ElementWiseOperation.SUM)
+
+        if layer_name is None:
+            layer_name = "trt.addLinear"
+        else:
+            layer_name = "trt.addLinear." + layer_name
+
+        self.layer_post_process(trt_layer, layer_name, precision)
+        return trt_layer.get_output(0)
 
     def addReLU(self, layer, x, layer_name=None, precision=None):
         trt_layer = self.network.add_activation(x, type=trt.ActivationType.RELU)
@@ -141,7 +170,22 @@ class TrtNetworkHelper():
         return x
 
     def addSoftmax(self, x: trt.ITensor, dim: int = -1, layer_name=None, precision=None) -> trt.ITensor:
-        # TODO: add softmax
+        trt_layer = self.network.add_softmax(x)
+
+        input_len = len(x.shape)
+        if dim is -1:
+            dim = input_len
+        trt_layer.axes = int(math.pow(2, input_len - 1))
+
+        layer_name_prefix = "nn.Softmax[dim=" + str(dim) + "]"
+        if layer_name is None:
+            layer_name = layer_name_prefix
+        else:
+            layer_name = layer_name_prefix + "." + layer_name
+
+        self.layer_post_process(trt_layer, layer_name, precision)
+
+        x = trt_layer.get_output(0)
         return x
 
     ################## unary op ###################
@@ -159,7 +203,15 @@ class TrtNetworkHelper():
 
     ################## elementwise op ###################
     def addAdd(self, a, b, layer_name=None, precision=None):
-        # add Add
+        trt_layer = self.network.add_elementwise(a, b, trt.ElementWiseOperation.SUM)
+        if layer_name is None:
+            layer_name = "elementwise.sum"
+        else:
+            layer_name = "elementwise.sum." + layer_name
+
+        self.layer_post_process(trt_layer, layer_name, precision)
+
+        x = trt_layer.get_output(0)
         return x
 
     # tensor and scalar op
@@ -171,12 +223,46 @@ class TrtNetworkHelper():
             precision: trt.DataType = None
     ) -> trt.ITensor:
         """scale"""
-        # TODOL add scale
+        input_len = len(x.shape)
+        if input_len < 3:
+            raise RuntimeError("input_len < 3 not support now!")
+
+        if layer_name is None:
+            layer_name ="Scale"
+
+        # The input dimension must be greater than or equal to 4
+        if input_len is 3:
+            trt_layer = self.network.add_shuffle(x)
+            trt_layer.reshape_dims = (0, 0, 0, 1)
+            self.layer_post_process(trt_layer, layer_name + ".3dto4d", precision)
+            x = trt_layer.get_output(0)
+
+        np_scale = trt.Weights(np.array([scale], dtype=np.float32))
+        trt_layer = self.network.add_scale(x, mode=trt.ScaleMode.UNIFORM,
+                                      shift=None, scale=np_scale, power=None)
+        self.layer_post_process(trt_layer, layer_name, precision)
+        x = trt_layer.get_output(0)
+
+        if input_len is 3:
+            trt_layer = self.network.add_shuffle(x)
+            trt_layer.reshape_dims = (0, 0, 0)
+            self.layer_post_process(trt_layer, layer_name + ".4dto3d", precision)
+            x = trt_layer.get_output(0)
 
         return x
 
     def addMatMul(self, a: trt.ITensor, b: trt.ITensor, layer_name: Optional[str] = None) -> trt.ITensor:
-        # add MatMul
+        trt_layer = self.network.add_matrix_multiply(a, trt.MatrixOperation.NONE,
+                                                     b, trt.MatrixOperation.NONE)
+
+        if layer_name is None:
+            layer_name = "torch.matmul"
+        else:
+            layer_name = "torch.matmul." + layer_name
+
+        self.layer_post_process(trt_layer, layer_name, None)
+
+        x = trt_layer.get_output(0)
         return x
 
 
