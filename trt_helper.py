@@ -119,44 +119,91 @@ class TrtNetworkHelper():
 
         return gelu_layer.get_output(0)
 
-    def getLayerNormPlugin(self):
-        for c in trt.get_plugin_registry().plugin_creator_list:
-            if c.name == 'LayerNorm':
-                return c.create_plugin(c.name, trt.PluginFieldCollection([]))
-        return None
-
     def addLayerNorm(self, x, gamma, beta, layer_name=None, precision=None):
-        # TODO: create your layer norm plugin
-        inputTensorList = []
-        inputTensorList.append(x)
-        pluginLayer = self.network.add_plugin_v2(inputTensorList, self.getLayerNormPlugin())
+        plg_creator = self.plugin_registry.get_plugin_creator("LayerNorm", "1", "")
+        if not plg_creator:
+            raise RuntimeError("Could not find LayerNorm")
 
-        self.network.mark_output(pluginLayer.get_output(0))
-        if layer_name is None:
-            layer_name = "trt.LayerNorm"
-        else:
-            layer_name = "trt.LayerNorm." + layer_name
+        # pfc = trt.PluginFieldCollection([data_type, dim, eps, gamma_w, beta_w])
+        pfc = trt.PluginFieldCollection([])
+        plugin = plg_creator.create_plugin("LayerNorm", pfc)
+        if not plugin:
+            raise RuntimeError("Could not create_plugin LayerNormPluginDynamic")
 
-        self.layer_post_process(pluginLayer, layer_name, precision)
-        return pluginLayer.get_output(0)
+        gamma = self.network.add_constant(gamma.shape, gamma).get_output(0)
+        beta = self.network.add_constant(beta.shape, beta).get_output(0)
 
-    def addLinear(self, x, weight, bias, layer_name=None, precision=None):
-        weight = np.array([weight])
-        constant_layer = self.network.add_constant(weight.shape, trt.Weights(weight))
-        X_mul = self.network.add_matrix_multiply(x, trt.MatrixOperation.NONE, constant_layer.get_output(0), trt.MatrixOperation.NONE)
-
-        out = X_mul.get_output(0)
-        bias = np.array([[bias]])
-        bias_layer = self.network.add_constant(bias.shape, trt.Weights(bias))
-        trt_layer = self.network.add_elementwise(X_mul.get_output(0), bias_layer.get_output(0), trt.ElementWiseOperation.SUM)
+        trt_layer = self.network.add_plugin_v2([x, gamma, beta], plugin)
 
         if layer_name is None:
-            layer_name = "trt.addLinear"
-        else:
-            layer_name = "trt.addLinear." + layer_name
+            layer_name = "nn.LayerNorm"
 
         self.layer_post_process(trt_layer, layer_name, precision)
+
         return trt_layer.get_output(0)
+
+    def addLinear(self, x, weight, bias, layer_name=None, precision=None):
+        input_len = len(x.shape)
+        if input_len < 3:
+            raise RuntimeError("addLinear x,shape.size must >= 3")
+
+        if layer_name is None:
+            layer_name = "nn.Linear"
+
+        # calc pre_reshape_dims and after_reshape_dims
+        pre_reshape_dims = trt.Dims()
+        after_reshape_dims = trt.Dims()
+        if input_len == 3:
+            pre_reshape_dims = (0, 0, 0, 1, 1)
+            after_reshape_dims =(0, 0, 0)
+        elif input_len == 4:
+            pre_reshape_dims = (0, 0, 0, 0, 1, 1)
+            after_reshape_dims = (0, 0, 0, 0)
+        elif input_len == 5:
+            pre_reshape_dims = (0, 0, 0, 0, 0, 1, 1)
+            after_reshape_dims = (0, 0, 0, 0, 0)
+        else:
+            raise RuntimeError("addLinear x.shape.size > 5 not support!")
+
+        # add pre_reshape layer
+        trt_layer = self.network.add_shuffle(x)
+        trt_layer.reshape_dims = pre_reshape_dims
+
+        self.layer_post_process(trt_layer, layer_name + "_pre_reshape", precision)
+
+        x = trt_layer.get_output(0)
+
+        # add Linear layer
+        out_features = weight.shape[1]
+        weight = trt.Weights(np.ascontiguousarray(weight))
+        if bias is not None:
+            bias = trt.Weights(bias)
+
+        trt_layer = self.network.add_fully_connected(x, out_features, weight, bias)
+        self.layer_post_process(trt_layer, layer_name, precision)
+        x = trt_layer.get_output(0)
+
+        # add after_reshape layer
+        trt_layer = self.network.add_shuffle(x)
+        trt_layer.reshape_dims = after_reshape_dims
+        self.layer_post_process(trt_layer, layer_name + "_after_reshape", precision)
+        x = trt_layer.get_output(0)
+
+        return x
+
+    def addReshape(self, x, reshape_dims, layer_name=None, precision=None):
+        trt_layer = self.network.add_shuffle(x)
+        trt_layer.reshape_dims = reshape_dims
+
+        if layer_name is None:
+            layer_name = "torch.reshape"
+        else:
+            layer_name = "torch.reshape." + layer_name
+
+        self.layer_post_process(trt_layer, layer_name, None)
+
+        x = trt_layer.get_output(0)
+        return x
 
     def addReLU(self, layer, x, layer_name=None, precision=None):
         trt_layer = self.network.add_activation(x, type=trt.ActivationType.RELU)
@@ -187,6 +234,17 @@ class TrtNetworkHelper():
 
         x = trt_layer.get_output(0)
         return x
+
+    def addTanh(self, x, layer_name=None, precision=None):
+        """Tanh"""
+        trt_layer = self.network.add_activation(x, type=trt.ActivationType.TANH)
+
+        if layer_name is None:
+            layer_name = "nn.Tanh"
+
+        self.layer_post_process(trt_layer, layer_name, precision)
+
+        return trt_layer.get_output(0)
 
     ################## unary op ###################
     def addLog(self, x: trt.ITensor, layer_name=None, precision=None):
