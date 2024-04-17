@@ -86,17 +86,20 @@ def self_attention_layer(network_helper, prefix, config, weights_dict, input_ten
     head_size = config.head_size
 
     q_w = weights_dict[prefix + "attention_self_query_kernel"]
+    q_w = np.transpose(q_w)
     q_b = weights_dict[prefix + "attention_self_query_bias"]
     q = network_helper.addLinear(input_tensor, q_w, q_b)
     q = network_helper.addShuffle(q, None, (0, -1, num_heads, head_size), (0, 2, 1, 3), "att_q_view_transpose")
 
     k_w = weights_dict[prefix + "attention_self_key_kernel"]
+    k_w = np.transpose(k_w)
     k_b = weights_dict[prefix + "attention_self_key_bias"]
     k = network_helper.addLinear(input_tensor, k_w, k_b)
     k = network_helper.addShuffle(k, None, (0, -1, num_heads, head_size), (0, 2, 3, 1), "att_k_view_and transpose")
     # k = network_helper.addShuffle(k, None, (0, -1, self.h, self.d_k), (0, 2, 3, 1), "att_k_view_and transpose")
 
     v_w = weights_dict[prefix + "attention_self_value_kernel"]
+    v_w = np.transpose(v_w)
     v_b = weights_dict[prefix + "attention_self_value_bias"]
     v = network_helper.addLinear(input_tensor, v_w, v_b)
     v = network_helper.addShuffle(v, None, (0, -1, num_heads, head_size), (0, 2, 1, 3), "att_v_view_and transpose")
@@ -116,6 +119,7 @@ def self_attention_layer(network_helper, prefix, config, weights_dict, input_ten
 def self_output_layer(network_helper, prefix, config, weights_dict, hidden_states, input_tensor):
 
     out_w = weights_dict[prefix + "attention_output_dense_kernel"]
+    out_w = np.transpose(out_w)
     out_b = weights_dict[prefix + "attention_output_dense_bias"]
     out = network_helper.addLinear(hidden_states, out_w, out_b)
 
@@ -281,8 +285,8 @@ def emb_layernorm(network_helper, config, weights_dict, builder_config, sequence
     token_type_embeds = network_helper.addEmbedding(token_type_ids, token_type_embeddings)
     position_embeds = network_helper.addEmbedding(position_ids, position_embeddings)
 
-    embeddings = network_helper.addAdd(input_embeds, position_embeds)
-    embeddings = network_helper.addAdd(embeddings, token_type_embeds)
+    embeddings = network_helper.addAdd(input_embeds, token_type_embeds)
+    embeddings = network_helper.addAdd(embeddings, position_embeds)
 
     gamma = weights_dict["embeddings_layernorm_gamma"]
     beta = weights_dict["embeddings_layernorm_beta"]
@@ -380,9 +384,11 @@ def test_text(infer_helper, BERT_PATH):
     input_list = [input_ids, token_type_ids, position_ids]
 
     output = infer_helper.infer(input_list)
+    print("output:")
     print(output)
 
-    logits = torch.from_numpy(output[0])
+    # logits = torch.from_numpy(output[0])
+    logits = torch.from_numpy(output[-1])
 
     softmax = F.softmax(logits, dim = -1)
     mask_word = softmax[0, mask_index, :]

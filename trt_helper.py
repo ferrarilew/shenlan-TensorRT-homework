@@ -22,6 +22,19 @@ class TrtNetworkHelper():
 
         self.input_num = 0
 
+    def broadcast_matrix(self, mat: np.array, nb_dims: int):
+        mat_nb_dims = len(mat.shape)
+        if mat_nb_dims >= nb_dims:
+            raise RuntimeError("broadcast_tensor mat_nb_dims >= nb_dims")
+
+        new_shape = np.ones([nb_dims], dtype=np.int32)
+        new_shape[-mat_nb_dims:] = mat.shape
+
+        new_mat = mat.reshape(new_shape)
+        self.logger.log(trt.Logger.INFO, "[Network] broadcast_matrix " + \
+                                          str(mat.shape) + " to " + str(new_mat.shape))
+        return new_mat
+
     def set_layer_name(self, layer, name):
         """
         Tool function. Set the name of trt layer or plugin and print output shapes.
@@ -93,11 +106,12 @@ class TrtNetworkHelper():
         return gather_layer.get_output(0)
 
     def addGELU(self, x, layer_name=None, precision=None):
-        POW = self.network.add_constant((1, 1, 1), trt.Weights(np.ascontiguousarray([3.0], dtype=np.float32)))
-        MULTIPLY = self.network.add_constant((1, 1, 1), trt.Weights(np.ascontiguousarray([0.044715], dtype=np.float32)))
-        SQRT = self.network.add_constant((1, 1, 1), trt.Weights((np.ascontiguousarray([0.79788456080286535587989211986876], dtype=np.float32))))
-        ONE = self.network.add_constant((1, 1, 1), trt.Weights((np.ascontiguousarray([1.0], dtype=np.float32))))
-        HALF = self.network.add_constant((1, 1, 1), trt.Weights((np.ascontiguousarray([0.5], dtype=np.float32))))
+        shape = (1, ) * len(x.shape)
+        POW = self.network.add_constant(shape, trt.Weights(np.ascontiguousarray([3.0], dtype=np.float32)))
+        MULTIPLY = self.network.add_constant(shape, trt.Weights(np.ascontiguousarray([0.044715], dtype=np.float32)))
+        SQRT = self.network.add_constant(shape, trt.Weights((np.ascontiguousarray([0.79788456080286535587989211986876], dtype=np.float32))))
+        ONE = self.network.add_constant(shape, trt.Weights((np.ascontiguousarray([1.0], dtype=np.float32))))
+        HALF = self.network.add_constant(shape, trt.Weights((np.ascontiguousarray([0.5], dtype=np.float32))))
         X_pow = self.network.add_elementwise(x, POW.get_output(0), trt.ElementWiseOperation.POW)
         X_pow_t = X_pow.get_output(0)
         X_mul = self.network.add_elementwise(X_pow_t, MULTIPLY.get_output(0), trt.ElementWiseOperation.PROD)
@@ -142,10 +156,10 @@ class TrtNetworkHelper():
 
         return trt_layer.get_output(0)
 
-    def addLinear(self, x, weight, bias, layer_name=None, precision=None):
+    def addLinearOld(self, x, weight, bias, layer_name=None, precision=None):
         input_len = len(x.shape)
         if input_len < 3:
-            raise RuntimeError("addLinear x,shape.size must >= 3")
+            raise RuntimeError("addLinear x.shape.size must >= 3")
 
         if layer_name is None:
             layer_name = "nn.Linear"
@@ -155,7 +169,7 @@ class TrtNetworkHelper():
         after_reshape_dims = trt.Dims()
         if input_len == 3:
             pre_reshape_dims = (0, 0, 0, 1, 1)
-            after_reshape_dims =(0, 0, 0)
+            after_reshape_dims = (0, 0, 0)
         elif input_len == 4:
             pre_reshape_dims = (0, 0, 0, 0, 1, 1)
             after_reshape_dims = (0, 0, 0, 0)
@@ -175,7 +189,7 @@ class TrtNetworkHelper():
 
         # add Linear layer
         out_features = weight.shape[1]
-        weight = trt.Weights(np.ascontiguousarray(weight))
+        weight = trt.Weights(np.ascontiguousarray(weight))  # weight = trt.Weights(weight)
         if bias is not None:
             bias = trt.Weights(bias)
 
@@ -188,6 +202,40 @@ class TrtNetworkHelper():
         trt_layer.reshape_dims = after_reshape_dims
         self.layer_post_process(trt_layer, layer_name + "_after_reshape", precision)
         x = trt_layer.get_output(0)
+
+        return x
+
+    def addLinear(self, x, weight, bias=None, layer_name=None, precision=None):
+        """Linear"""
+        # If input B is a constant, we transpose at parse time if necessary,
+        # because In some cases, A * Bt is much slower than A * B.
+        # weight = np.copy(weight.transpose(1, 0), order='C')
+        weight = self.broadcast_matrix(weight, len(x.shape))
+
+        weight_layer = self.network.add_constant(weight.shape, trt.Weights(np.ascontiguousarray(weight)))
+        weight = weight_layer.get_output(0)
+        # trt_layer = self.network.add_matrix_multiply(x, trt.MatrixOperation.NONE, weight, trt.MatrixOperation.TRANSPOSE)
+        trt_layer = self.network.add_matrix_multiply(x, trt.MatrixOperation.NONE, weight, trt.MatrixOperation.NONE)
+        x = trt_layer.get_output(0)
+
+        if layer_name is None:
+            layer_name = "Linear"
+        else:
+            layer_name = "Linear." + layer_name
+
+        self.layer_post_process(trt_layer, layer_name, precision)
+
+        if bias is not None:
+            bias = self.broadcast_matrix(bias, len(x.shape))
+            bias_layer = self.network.add_constant(bias.shape, trt.Weights(bias))
+            bias = bias_layer.get_output(0)
+            trt_layer = self.network.add_elementwise(x, bias, trt.ElementWiseOperation.SUM)
+            x = trt_layer.get_output(0)
+
+            if layer_name is None:
+                layer_name = "Linear.bias"
+            else:
+                layer_name = "Linear.bias." + layer_name
 
         return x
 
@@ -220,7 +268,7 @@ class TrtNetworkHelper():
         trt_layer = self.network.add_softmax(x)
 
         input_len = len(x.shape)
-        if dim is -1:
+        if dim == -1:
             dim = input_len
         trt_layer.axes = int(math.pow(2, input_len - 1))
 
@@ -289,7 +337,7 @@ class TrtNetworkHelper():
             layer_name ="Scale"
 
         # The input dimension must be greater than or equal to 4
-        if input_len is 3:
+        if input_len == 3:
             trt_layer = self.network.add_shuffle(x)
             trt_layer.reshape_dims = (0, 0, 0, 1)
             self.layer_post_process(trt_layer, layer_name + ".3dto4d", precision)
@@ -301,7 +349,7 @@ class TrtNetworkHelper():
         self.layer_post_process(trt_layer, layer_name, precision)
         x = trt_layer.get_output(0)
 
-        if input_len is 3:
+        if input_len == 3:
             trt_layer = self.network.add_shuffle(x)
             trt_layer.reshape_dims = (0, 0, 0)
             self.layer_post_process(trt_layer, layer_name + ".4dto3d", precision)
